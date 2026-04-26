@@ -1,0 +1,9 @@
+name: Catch-prediction-model
+
+services:
+  cnn-dev:
+    build: .
+    container_name: CNN-Project
+    volumes:
+      - .:/app
+    working_dir: /app
