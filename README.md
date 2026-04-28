@@ -49,7 +49,7 @@
 
 
 
-![image-20260428204645594](C:\Users\User\AppData\Roaming\Typora\typora-user-images\image-20260428204645594.png)
+![제주 갈치 어장 해역](https://github.com/user-attachments/assets/8892a4aa-06f0-4577-a93f-3030fd426ac4)
 
 
 
@@ -173,7 +173,7 @@ Catch-prediction-model/
   - xarray  라이브러리를 통해 구조 확인 및 시각화
   - 해당 지점 데이터를 엑셀화하여 출력
 
-  <img src="C:\Users\User\AppData\Roaming\Typora\typora-user-images\image-20260428212207874.png" alt="image-20260428212207874" style="zoom:50%;" />
+  <img width="1148" height="1572" alt="Image" src="https://github.com/user-attachments/assets/07124f2e-2967-4deb-9007-680388ce803b" />
 
 - [✅] NC 파일 → 엑셀 변환 코드 작성 (제주 해역 필터링 포함)
 
