@@ -1,0 +1,7 @@
+api_key.py
+data/
+
+# 가상환경
+.venv/
+venv/
+env/

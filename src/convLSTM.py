@@ -1,26 +1,25 @@
 """
-제주 갈치 어획량 예측 - LSTM 모델
+제주 갈치 어획량 예측 - ConvLSTM 모델
 
-[LSTM이란?]
-  Long Short-Term Memory - 시계열 의존성을 자동 학습
-  과거 12개월 환경변수 시퀀스를 보고 다음 달 어획량 예측
+[ConvLSTM이란?]
+  Convolutional LSTM - 시공간 통합 학습의 최강 모델
+  - LSTM 내부 연산을 모두 Convolution으로 대체
+  - 공간 구조를 유지하면서 시계열 학습
+  - 해양/기상 예측 분야의 State-of-the-Art
 
-[입력 형태]
-  (배치, 시퀀스길이=12, 특성수=6)
-  → 과거 12개월 환경변수 → 다음 달 어획량
+[CNN-LSTM과의 차이]
+  CNN-LSTM:
+    각 시점 → CNN으로 압축(1D 벡터) → LSTM
+    문제: 공간 구조 손실
+    
+  ConvLSTM:
+    공간 구조 유지하면서 시간 학습
+    Gate 연산 자체가 Convolution
+    문제 없음 → 더 강력
 
-[모델 구조]
-  Input (6변수 × 12개월)
-    ↓
-  LSTM (hidden=64)
-    ↓
-  Dropout (0.2)
-    ↓
-  LSTM (hidden=32)
-    ↓
-  Dense (16)
-    ↓
-  Output (어획량)
+[참고 논문]
+  Shi et al. (2015) "Convolutional LSTM Network"
+  → 강수량 예측, 해양 SST 예측에 표준
 """
 
 import os
@@ -34,6 +33,7 @@ from tkinter import filedialog, messagebox
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from sklearn.preprocessing import MinMaxScaler
@@ -47,16 +47,18 @@ mpl.rcParams["axes.unicode_minus"] = False
 TRAIN_END = "2020-12-01"
 VAL_END   = "2022-12-01"
 
-SEQ_LENGTH  = 12      # 과거 12개월로 다음 달 예측
-HIDDEN_SIZE = 64      # LSTM 은닉 유닛 수
-NUM_LAYERS  = 2       # LSTM 층 수
-DROPOUT     = 0.2
-BATCH_SIZE  = 16
-EPOCHS      = 200
-LR          = 0.001
-SEED        = 42
+DEPTH_LAYERS   = 10
+SEQ_LENGTH     = 12
+HIDDEN_CHANNELS = 32     # ConvLSTM 은닉 채널
+KERNEL_SIZE    = 3       # Conv 커널 크기
+NUM_LAYERS     = 2       # ConvLSTM 층 수
+DROPOUT        = 0.3
+BATCH_SIZE     = 4       # ConvLSTM은 메모리 많이 씀
+EPOCHS         = 200
+LR             = 0.0005
+PATIENCE       = 30
+SEED           = 42
 
-# 재현성
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
@@ -68,7 +70,7 @@ root = tk.Tk()
 root.withdraw()
 
 print("=" * 60)
-print("LSTM 모델 학습")
+print("ConvLSTM 모델 학습 (시공간 통합)")
 print("=" * 60)
 
 nc_path = filedialog.askopenfilename(
@@ -84,51 +86,58 @@ import xarray as xr
 
 print(f"\nNC 파일 로드: {os.path.basename(nc_path)}")
 ds = xr.open_dataset(nc_path)
-ds_surf = ds.isel(depth=slice(0, 10))
+ds = ds.isel(depth=slice(0, DEPTH_LAYERS))
 
 env_vars = ["thetao", "so", "uo", "vo", "chl", "o2"]
-df = pd.DataFrame({
-    var: ds_surf[var].mean(dim=["depth", "latitude", "longitude"], skipna=True).values
+
+X_full = np.stack([
+    ds[var].mean(dim="depth", skipna=True).values
     for var in env_vars
-})
-df["catch"] = ds["catch"].values
-df["date"]  = pd.to_datetime(ds["time"].values)
+], axis=1)  # (time, channels, lat, lon)
 
-for col in env_vars:
-    df[col] = df[col].interpolate(method="linear", limit_direction="both")
+y_full = ds["catch"].values
+times  = pd.to_datetime(ds["time"].values)
 
-print(f"전체 데이터: {len(df)}개월 ({df['date'].min().strftime('%Y-%m')} ~ {df['date'].max().strftime('%Y-%m')})")
+# 결측치 처리
+for i in range(X_full.shape[1]):
+    channel  = X_full[:, i, :, :]
+    mean_val = np.nanmean(channel)
+    X_full[:, i, :, :] = np.where(np.isnan(channel), mean_val, channel)
 
-# ── 정규화 (Train 기준) ──────────────────────────
-train_mask = df["date"] <= TRAIN_END
-train_df = df[train_mask]
+print(f"  원본 형태: {X_full.shape}")
 
-x_scaler = MinMaxScaler()
+# 정규화
+train_mask_initial = times <= TRAIN_END
+
+x_scalers = {}
+for i, var in enumerate(env_vars):
+    v_min = X_full[train_mask_initial, i].min()
+    v_max = X_full[train_mask_initial, i].max()
+    rng   = v_max - v_min if v_max != v_min else 1.0
+    X_full[:, i] = (X_full[:, i] - v_min) / rng
+    x_scalers[var] = {"min": float(v_min), "max": float(v_max)}
+
 y_scaler = MinMaxScaler()
+y_scaler.fit(y_full[train_mask_initial].reshape(-1, 1))
+y_scaled = y_scaler.transform(y_full.reshape(-1, 1)).flatten()
 
-# Train 기준으로 fit
-x_scaler.fit(train_df[env_vars].values)
-y_scaler.fit(train_df[["catch"]].values)
-
-# 전체 데이터에 transform
-X_scaled = x_scaler.transform(df[env_vars].values)
-y_scaled = y_scaler.transform(df[["catch"]].values).flatten()
-
-# ── 시퀀스 데이터 생성 ───────────────────────────
+# 시퀀스 생성
 def make_sequences(X, y, dates, seq_len):
     Xs, ys, ds_list = [], [], []
     for i in range(len(X) - seq_len):
         Xs.append(X[i:i+seq_len])
         ys.append(y[i+seq_len])
         ds_list.append(dates[i+seq_len])
-    return np.array(Xs), np.array(ys), np.array(ds_list)
+    return (
+        np.array(Xs, dtype=np.float32),
+        np.array(ys, dtype=np.float32),
+        np.array(ds_list),
+    )
 
-X_seq, y_seq, date_seq = make_sequences(
-    X_scaled, y_scaled, df["date"].values, SEQ_LENGTH
-)
-print(f"\n시퀀스 데이터: {X_seq.shape}  (샘플, 시퀀스, 특성)")
+X_seq, y_seq, date_seq = make_sequences(X_full, y_scaled, times.values, SEQ_LENGTH)
+print(f"  시퀀스 형태: {X_seq.shape}")
 
-# ── 분할 ─────────────────────────────────────────
+# 분할
 train_idx = date_seq <= np.datetime64(TRAIN_END)
 val_idx   = (date_seq > np.datetime64(TRAIN_END)) & (date_seq <= np.datetime64(VAL_END))
 test_idx  = date_seq > np.datetime64(VAL_END)
@@ -140,7 +149,6 @@ date_test        = date_seq[test_idx]
 
 print(f"  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
-# Tensor 변환
 X_train_t = torch.FloatTensor(X_train).to(DEVICE)
 y_train_t = torch.FloatTensor(y_train).to(DEVICE)
 X_val_t   = torch.FloatTensor(X_val).to(DEVICE)
@@ -153,33 +161,114 @@ train_loader = DataLoader(
     batch_size=BATCH_SIZE, shuffle=True
 )
 
-# ── LSTM 모델 정의 ───────────────────────────────
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout):
+
+# ── ConvLSTM Cell 정의 ───────────────────────────
+class ConvLSTMCell(nn.Module):
+    """
+    ConvLSTM 단일 셀
+    - 일반 LSTM의 행렬곱을 Conv 연산으로 교체
+    - 공간 구조를 유지하면서 시간 정보 학습
+    """
+    def __init__(self, in_channels, hidden_channels, kernel_size):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
-            batch_first=True,
+        padding = kernel_size // 2
+        self.hidden_channels = hidden_channels
+
+        # 4개 gate (i, f, g, o)를 한 번에 계산
+        self.conv = nn.Conv2d(
+            in_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size=kernel_size,
+            padding=padding,
         )
+
+    def forward(self, x, h_prev, c_prev):
+        # x: (B, C_in, H, W), h_prev/c_prev: (B, C_hidden, H, W)
+        combined = torch.cat([x, h_prev], dim=1)  # 채널 방향 결합
+        gates = self.conv(combined)
+
+        i, f, g, o = torch.split(gates, self.hidden_channels, dim=1)
+        i = torch.sigmoid(i)   # input gate
+        f = torch.sigmoid(f)   # forget gate
+        g = torch.tanh(g)      # candidate
+        o = torch.sigmoid(o)   # output gate
+
+        c_new = f * c_prev + i * g
+        h_new = o * torch.tanh(c_new)
+
+        return h_new, c_new
+
+    def init_hidden(self, batch_size, height, width, device):
+        h = torch.zeros(batch_size, self.hidden_channels, height, width, device=device)
+        c = torch.zeros(batch_size, self.hidden_channels, height, width, device=device)
+        return h, c
+
+
+class ConvLSTM(nn.Module):
+    """다층 ConvLSTM"""
+    def __init__(self, in_channels, hidden_channels, kernel_size, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_channels = hidden_channels
+
+        layers = []
+        for i in range(num_layers):
+            ic = in_channels if i == 0 else hidden_channels
+            layers.append(ConvLSTMCell(ic, hidden_channels, kernel_size))
+        self.cells = nn.ModuleList(layers)
+
+    def forward(self, x):
+        # x: (B, T, C, H, W)
+        B, T, C, H, W = x.shape
+
+        # 각 레이어의 hidden state 초기화
+        h, c = [], []
+        for cell in self.cells:
+            h_l, c_l = cell.init_hidden(B, H, W, x.device)
+            h.append(h_l); c.append(c_l)
+
+        # 시간 순회
+        for t in range(T):
+            x_t = x[:, t]
+            for l, cell in enumerate(self.cells):
+                h[l], c[l] = cell(x_t, h[l], c[l])
+                x_t = h[l]
+
+        # 마지막 시점의 마지막 레이어 hidden state 반환
+        return h[-1]  # (B, hidden_channels, H, W)
+
+
+class ConvLSTMModel(nn.Module):
+    def __init__(self, in_channels, hidden_channels, kernel_size,
+                 num_layers, dropout):
+        super().__init__()
+        self.conv_lstm = ConvLSTM(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            kernel_size=kernel_size,
+            num_layers=num_layers,
+        )
+
+        # 공간 정보를 단일 값으로 압축
+        self.gap = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 16),
+            nn.Linear(hidden_channels, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(16, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(self, x):
-        out, _ = self.lstm(x)             # (batch, seq, hidden)
-        out = out[:, -1, :]               # 마지막 타임스텝
+        # x: (B, T, C, H, W)
+        out = self.conv_lstm(x)            # (B, hidden, H, W)
+        out = self.gap(out).flatten(1)      # (B, hidden)
         return self.fc(out).squeeze(-1)
 
 
-model = LSTMModel(
-    input_size=len(env_vars),
-    hidden_size=HIDDEN_SIZE,
+model = ConvLSTMModel(
+    in_channels=len(env_vars),
+    hidden_channels=HIDDEN_CHANNELS,
+    kernel_size=KERNEL_SIZE,
     num_layers=NUM_LAYERS,
     dropout=DROPOUT,
 ).to(DEVICE)
@@ -189,25 +278,21 @@ print(model)
 print(f"\n학습 파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
 
 # ── 학습 ─────────────────────────────────────────
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 criterion = nn.MSELoss()
-
-# 학습률 스케줄러
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="min", factor=0.5, patience=10
 )
 
 best_val_loss = float("inf")
-patience = 30
+best_state = None
 patience_counter = 0
-best_model_state = None
-
 train_losses, val_losses = [], []
 
 print(f"\n{'='*60}\n학습 시작 (최대 {EPOCHS} epochs)\n{'='*60}")
+print("⚠ ConvLSTM은 학습이 오래 걸려요 (CPU 기준 10~20분)\n")
 
 for epoch in range(EPOCHS):
-    # Train
     model.train()
     train_loss = 0
     for xb, yb in train_loader:
@@ -215,11 +300,12 @@ for epoch in range(EPOCHS):
         pred = model(xb)
         loss = criterion(pred, yb)
         loss.backward()
+        # Gradient clipping (안정성)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         train_loss += loss.item() * len(xb)
     train_loss /= len(X_train)
 
-    # Validation
     model.eval()
     with torch.no_grad():
         val_pred = model(X_val_t)
@@ -229,30 +315,27 @@ for epoch in range(EPOCHS):
     val_losses.append(val_loss)
     scheduler.step(val_loss)
 
-    # Early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
-        best_model_state = model.state_dict().copy()
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
         patience_counter = 0
     else:
         patience_counter += 1
-        if patience_counter >= patience:
+        if patience_counter >= PATIENCE:
             print(f"  Early stopping at epoch {epoch+1}")
             break
 
-    if (epoch + 1) % 10 == 0:
+    if (epoch + 1) % 5 == 0:
         print(f"  Epoch {epoch+1:3d}: train_loss={train_loss:.5f}, val_loss={val_loss:.5f}")
 
-# 최적 모델 복원
-model.load_state_dict(best_model_state)
+model.load_state_dict(best_state)
 
 # ── 평가 ─────────────────────────────────────────
 model.eval()
 with torch.no_grad():
-    y_pred_scaled = model(X_test_t).cpu().numpy()
+    y_pred_n = model(X_test_t).cpu().numpy()
 
-# 역정규화
-y_pred = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+y_pred = y_scaler.inverse_transform(y_pred_n.reshape(-1, 1)).flatten()
 y_true = y_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
 
 def evaluate(y_true, y_pred):
@@ -266,44 +349,47 @@ def evaluate(y_true, y_pred):
 metrics = evaluate(y_true, y_pred)
 
 print(f"\n{'='*60}")
-print(f"LSTM 평가 결과 (Test)")
+print(f"ConvLSTM 평가 결과 (Test)")
 print(f"{'='*60}")
 print(f"  RMSE: {metrics['RMSE']:.2f} 톤")
 print(f"  MAE:  {metrics['MAE']:.2f} 톤")
 print(f"  MAPE: {metrics['MAPE']:.2f} %")
 print(f"  R²:   {metrics['R2']:.4f}")
 
-# ── 베이스라인 비교 ──────────────────────────────
-baseline_dir = os.path.join(os.path.dirname(nc_path), "..", "..", "outputs", "baseline")
-baseline_metrics_path = os.path.join(baseline_dir, "metrics.csv")
-
-if os.path.exists(baseline_metrics_path):
-    baseline_df = pd.read_csv(baseline_metrics_path, index_col=0)
-    print(f"\n[베이스라인 vs LSTM]")
-    print(baseline_df.round(2).to_string())
-    print(f"  LSTM            {metrics['RMSE']:7.2f} {metrics['MAE']:7.2f} {metrics['MAPE']:7.2f} {metrics['R2']:7.4f}")
+# ── 전체 모델 비교 ───────────────────────────────
+print(f"\n[전체 모델 비교]")
+print(f"  베이스라인 XGBoost:   R² ~0.76,  MAPE ~47%")
+print(f"  LSTM     (시간만):   R² ~0.55,  MAPE ~55%")
+print(f"  CNN      (공간만):   R² ~0.67,  MAPE ~39%")
+print(f"  CNN-LSTM (시공간):   R² ~0.74,  MAPE ~40%")
+print(f"  ConvLSTM (시공통합): R² {metrics['R2']:.3f},  MAPE {metrics['MAPE']:.1f}%")
 
 # ── 저장 ─────────────────────────────────────────
-save_dir = os.path.join(os.path.dirname(nc_path), "..", "..", "outputs", "lstm")
+save_dir = os.path.join(os.path.dirname(nc_path), "..", "..", "outputs", "convlstm")
 os.makedirs(save_dir, exist_ok=True)
 
-# 모델 저장
 torch.save({
     "model_state_dict": model.state_dict(),
     "config": {
-        "input_size": len(env_vars),
-        "hidden_size": HIDDEN_SIZE,
-        "num_layers": NUM_LAYERS,
-        "dropout": DROPOUT,
-        "seq_length": SEQ_LENGTH,
+        "in_channels":     len(env_vars),
+        "hidden_channels": HIDDEN_CHANNELS,
+        "kernel_size":     KERNEL_SIZE,
+        "num_layers":      NUM_LAYERS,
+        "dropout":         DROPOUT,
+        "seq_length":      SEQ_LENGTH,
     },
-}, os.path.join(save_dir, "lstm_model.pt"))
+    "x_scalers": x_scalers,
+    "y_scaler": {
+        "min": float(y_scaler.data_min_[0]),
+        "max": float(y_scaler.data_max_[0]),
+    },
+}, os.path.join(save_dir, "convlstm_model.pt"))
 
-# 메트릭 저장
+# JSON 저장 시 numpy float 변환
+metrics_json = {k: float(v) for k, v in metrics.items()}
 with open(os.path.join(save_dir, "metrics.json"), "w", encoding="utf-8") as f:
-    json.dump(metrics, f, indent=2, ensure_ascii=False)
+    json.dump(metrics_json, f, indent=2, ensure_ascii=False)
 
-# 예측값 저장
 pred_df = pd.DataFrame({
     "date":      pd.to_datetime(date_test),
     "actual":    y_true,
@@ -312,11 +398,10 @@ pred_df = pd.DataFrame({
 pred_df.to_csv(os.path.join(save_dir, "predictions.csv"),
                index=False, encoding="utf-8-sig")
 
-# 학습 곡선 저장
 loss_df = pd.DataFrame({
-    "epoch": range(1, len(train_losses) + 1),
+    "epoch":      range(1, len(train_losses) + 1),
     "train_loss": train_losses,
-    "val_loss": val_losses,
+    "val_loss":   val_losses,
 })
 loss_df.to_csv(os.path.join(save_dir, "training_history.csv"),
                index=False, encoding="utf-8-sig")
@@ -329,8 +414,8 @@ ax = axes[0, 0]
 ax.plot(pd.to_datetime(date_test), y_true, "o-", color="#0D2444",
         label="실제값", linewidth=2, markersize=5)
 ax.plot(pd.to_datetime(date_test), y_pred, "d--", color="#C13C2A",
-        label="LSTM 예측", linewidth=1.8, markersize=5, alpha=0.85)
-ax.set_title("LSTM 예측 결과 (Test: 2023~2025)", fontsize=12, fontweight="bold")
+        label="ConvLSTM 예측", linewidth=1.8, markersize=5, alpha=0.85)
+ax.set_title("ConvLSTM 예측 결과 (Test: 2023~2025)", fontsize=12, fontweight="bold")
 ax.set_ylabel("어획량 (톤)")
 ax.legend(loc="best")
 ax.grid(alpha=0.3)
@@ -351,13 +436,13 @@ ax = axes[1, 0]
 metric_names = ["RMSE", "MAE", "MAPE"]
 vals = [metrics[m] for m in metric_names]
 bars = ax.bar(metric_names, vals, color=["#0F6E56", "#185FA5", "#EF9F27"], alpha=0.85)
-ax.set_title("LSTM 성능 지표", fontsize=12, fontweight="bold")
+ax.set_title("ConvLSTM 성능 지표", fontsize=12, fontweight="bold")
 ax.grid(alpha=0.3, axis="y")
 for bar, v in zip(bars, vals):
     ax.text(bar.get_x() + bar.get_width()/2, v + max(vals)*0.02,
             f"{v:.2f}", ha="center", fontsize=11, fontweight="bold")
 
-# (4) 산점도 (실제 vs 예측)
+# (4) 산점도
 ax = axes[1, 1]
 ax.scatter(y_true, y_pred, alpha=0.65, color="#185FA5", s=50, edgecolor="white")
 lim = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
@@ -369,7 +454,7 @@ ax.legend()
 ax.grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig(os.path.join(save_dir, "lstm_results.png"),
+plt.savefig(os.path.join(save_dir, "convlstm_results.png"),
             dpi=120, bbox_inches="tight")
 
 print(f"\n[저장 위치]")
@@ -378,7 +463,7 @@ print(f"  {save_dir}")
 plt.show()
 messagebox.showinfo(
     "완료",
-    f"LSTM 학습 완료!\n\n"
+    f"ConvLSTM 학습 완료!\n\n"
     f"R²: {metrics['R2']:.4f}\n"
     f"MAPE: {metrics['MAPE']:.2f}%\n"
     f"RMSE: {metrics['RMSE']:.2f}톤"

@@ -1,24 +1,27 @@
 """
-제주 갈치 어획량 예측 - LSTM 모델
+제주 갈치 어획량 예측 - CNN 모델
 
-[LSTM이란?]
-  Long Short-Term Memory - 시계열 의존성을 자동 학습
-  과거 12개월 환경변수 시퀀스를 보고 다음 달 어획량 예측
+[CNN이란?]
+  Convolutional Neural Network - 공간 패턴 학습 (이미지/지도 분석)
+  각 시점의 25×30 격자에서 공간적 패턴을 추출해 어획량 예측
 
 [입력 형태]
-  (배치, 시퀀스길이=12, 특성수=6)
-  → 과거 12개월 환경변수 → 다음 달 어획량
+  (배치, 6채널, 25위도, 30경도)
+  → 환경변수 6개를 RGB처럼 채널로 사용
+  → 위경도 격자는 이미지의 H×W처럼 처리
 
 [모델 구조]
-  Input (6변수 × 12개월)
+  Input (6, 25, 30)
     ↓
-  LSTM (hidden=64)
+  Conv2d(6→32) + BatchNorm + ReLU + MaxPool
     ↓
-  Dropout (0.2)
+  Conv2d(32→64) + BatchNorm + ReLU + MaxPool
     ↓
-  LSTM (hidden=32)
+  Conv2d(64→128) + BatchNorm + ReLU
     ↓
-  Dense (16)
+  Global Average Pooling
+    ↓
+  Dense(128→64→1)
     ↓
   Output (어획량)
 """
@@ -34,6 +37,7 @@ from tkinter import filedialog, messagebox
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from sklearn.preprocessing import MinMaxScaler
@@ -47,16 +51,14 @@ mpl.rcParams["axes.unicode_minus"] = False
 TRAIN_END = "2020-12-01"
 VAL_END   = "2022-12-01"
 
-SEQ_LENGTH  = 12      # 과거 12개월로 다음 달 예측
-HIDDEN_SIZE = 64      # LSTM 은닉 유닛 수
-NUM_LAYERS  = 2       # LSTM 층 수
-DROPOUT     = 0.2
-BATCH_SIZE  = 16
-EPOCHS      = 200
-LR          = 0.001
-SEED        = 42
+DEPTH_LAYERS = 10     # 표층~30m
+BATCH_SIZE   = 16
+EPOCHS       = 200
+LR           = 0.001
+DROPOUT      = 0.3
+SEED         = 42
+PATIENCE     = 30
 
-# 재현성
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
@@ -68,7 +70,7 @@ root = tk.Tk()
 root.withdraw()
 
 print("=" * 60)
-print("LSTM 모델 학습")
+print("CNN 모델 학습 (공간 격자 활용)")
 print("=" * 60)
 
 nc_path = filedialog.askopenfilename(
@@ -84,123 +86,139 @@ import xarray as xr
 
 print(f"\nNC 파일 로드: {os.path.basename(nc_path)}")
 ds = xr.open_dataset(nc_path)
-ds_surf = ds.isel(depth=slice(0, 10))
+
+# 깊이 슬라이스 후 깊이 평균 (격자 정보 유지)
+ds = ds.isel(depth=slice(0, DEPTH_LAYERS))
 
 env_vars = ["thetao", "so", "uo", "vo", "chl", "o2"]
-df = pd.DataFrame({
-    var: ds_surf[var].mean(dim=["depth", "latitude", "longitude"], skipna=True).values
+
+# (time, depth, lat, lon) → (time, lat, lon) - 깊이 평균
+X_full = np.stack([
+    ds[var].mean(dim="depth", skipna=True).values
     for var in env_vars
-})
-df["catch"] = ds["catch"].values
-df["date"]  = pd.to_datetime(ds["time"].values)
+], axis=1)  # (time, channels, lat, lon)
 
-for col in env_vars:
-    df[col] = df[col].interpolate(method="linear", limit_direction="both")
+y_full = ds["catch"].values
+times  = pd.to_datetime(ds["time"].values)
 
-print(f"전체 데이터: {len(df)}개월 ({df['date'].min().strftime('%Y-%m')} ~ {df['date'].max().strftime('%Y-%m')})")
+print(f"  입력 형태: {X_full.shape}  (time, channels, lat, lon)")
+print(f"  출력 형태: {y_full.shape}")
+print(f"  기간: {times.min().strftime('%Y-%m')} ~ {times.max().strftime('%Y-%m')}")
 
-# ── 정규화 (Train 기준) ──────────────────────────
-train_mask = df["date"] <= TRAIN_END
-train_df = df[train_mask]
+# ── 결측치 처리 ──────────────────────────────────
+# NaN을 채널별 평균으로 채우기
+for i in range(X_full.shape[1]):
+    channel = X_full[:, i, :, :]
+    mean_val = np.nanmean(channel)
+    X_full[:, i, :, :] = np.where(np.isnan(channel), mean_val, channel)
 
-x_scaler = MinMaxScaler()
+print(f"  결측치 처리 완료")
+
+# ── 시간 기준 분할 ───────────────────────────────
+train_mask = times <= TRAIN_END
+val_mask   = (times > TRAIN_END) & (times <= VAL_END)
+test_mask  = times > VAL_END
+
+X_train = X_full[train_mask]
+y_train = y_full[train_mask]
+X_val   = X_full[val_mask]
+y_val   = y_full[val_mask]
+X_test  = X_full[test_mask]
+y_test  = y_full[test_mask]
+date_test = times[test_mask]
+
+print(f"\n  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+
+# ── 정규화 (Train 기준, 채널별) ──────────────────
+x_scalers = {}
+X_train_n = np.zeros_like(X_train, dtype=np.float32)
+X_val_n   = np.zeros_like(X_val,   dtype=np.float32)
+X_test_n  = np.zeros_like(X_test,  dtype=np.float32)
+
+for i, var in enumerate(env_vars):
+    v_min = X_train[:, i].min()
+    v_max = X_train[:, i].max()
+    rng = v_max - v_min if v_max != v_min else 1.0
+
+    X_train_n[:, i] = (X_train[:, i] - v_min) / rng
+    X_val_n[:, i]   = (X_val[:, i]   - v_min) / rng
+    X_test_n[:, i]  = (X_test[:, i]  - v_min) / rng
+    x_scalers[var] = {"min": float(v_min), "max": float(v_max)}
+
+# y 정규화
 y_scaler = MinMaxScaler()
+y_train_n = y_scaler.fit_transform(y_train.reshape(-1, 1)).flatten().astype(np.float32)
+y_val_n   = y_scaler.transform(y_val.reshape(-1, 1)).flatten().astype(np.float32)
+y_test_n  = y_scaler.transform(y_test.reshape(-1, 1)).flatten().astype(np.float32)
 
-# Train 기준으로 fit
-x_scaler.fit(train_df[env_vars].values)
-y_scaler.fit(train_df[["catch"]].values)
-
-# 전체 데이터에 transform
-X_scaled = x_scaler.transform(df[env_vars].values)
-y_scaled = y_scaler.transform(df[["catch"]].values).flatten()
-
-# ── 시퀀스 데이터 생성 ───────────────────────────
-def make_sequences(X, y, dates, seq_len):
-    Xs, ys, ds_list = [], [], []
-    for i in range(len(X) - seq_len):
-        Xs.append(X[i:i+seq_len])
-        ys.append(y[i+seq_len])
-        ds_list.append(dates[i+seq_len])
-    return np.array(Xs), np.array(ys), np.array(ds_list)
-
-X_seq, y_seq, date_seq = make_sequences(
-    X_scaled, y_scaled, df["date"].values, SEQ_LENGTH
-)
-print(f"\n시퀀스 데이터: {X_seq.shape}  (샘플, 시퀀스, 특성)")
-
-# ── 분할 ─────────────────────────────────────────
-train_idx = date_seq <= np.datetime64(TRAIN_END)
-val_idx   = (date_seq > np.datetime64(TRAIN_END)) & (date_seq <= np.datetime64(VAL_END))
-test_idx  = date_seq > np.datetime64(VAL_END)
-
-X_train, y_train = X_seq[train_idx], y_seq[train_idx]
-X_val,   y_val   = X_seq[val_idx],   y_seq[val_idx]
-X_test,  y_test  = X_seq[test_idx],  y_seq[test_idx]
-date_test        = date_seq[test_idx]
-
-print(f"  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+print(f"  정규화 완료 (Train 기준)")
 
 # Tensor 변환
-X_train_t = torch.FloatTensor(X_train).to(DEVICE)
-y_train_t = torch.FloatTensor(y_train).to(DEVICE)
-X_val_t   = torch.FloatTensor(X_val).to(DEVICE)
-y_val_t   = torch.FloatTensor(y_val).to(DEVICE)
-X_test_t  = torch.FloatTensor(X_test).to(DEVICE)
-y_test_t  = torch.FloatTensor(y_test).to(DEVICE)
+X_train_t = torch.FloatTensor(X_train_n).to(DEVICE)
+y_train_t = torch.FloatTensor(y_train_n).to(DEVICE)
+X_val_t   = torch.FloatTensor(X_val_n).to(DEVICE)
+y_val_t   = torch.FloatTensor(y_val_n).to(DEVICE)
+X_test_t  = torch.FloatTensor(X_test_n).to(DEVICE)
+y_test_t  = torch.FloatTensor(y_test_n).to(DEVICE)
 
 train_loader = DataLoader(
     TensorDataset(X_train_t, y_train_t),
     batch_size=BATCH_SIZE, shuffle=True
 )
 
-# ── LSTM 모델 정의 ───────────────────────────────
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout):
+# ── CNN 모델 정의 ────────────────────────────────
+class CNNModel(nn.Module):
+    def __init__(self, in_channels, dropout=0.3):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0,
-            batch_first=True,
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 16),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(16, 1),
-        )
+
+        # Block 1: 6 → 32
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.bn1   = nn.BatchNorm2d(32)
+
+        # Block 2: 32 → 64
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2   = nn.BatchNorm2d(64)
+
+        # Block 3: 64 → 128
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3   = nn.BatchNorm2d(128)
+
+        # Pooling
+        self.pool = nn.MaxPool2d(2, 2)
+        self.gap  = nn.AdaptiveAvgPool2d(1)  # Global Average Pool
+
+        # FC
+        self.fc1 = nn.Linear(128, 64)
+        self.fc2 = nn.Linear(64, 1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out, _ = self.lstm(x)             # (batch, seq, hidden)
-        out = out[:, -1, :]               # 마지막 타임스텝
-        return self.fc(out).squeeze(-1)
+        # x: (B, 6, 25, 30)
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))   # (B, 32, 12, 15)
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))   # (B, 64, 6, 7)
+        x = F.relu(self.bn3(self.conv3(x)))              # (B, 128, 6, 7)
+        x = self.gap(x).flatten(1)                       # (B, 128)
+        x = self.dropout(F.relu(self.fc1(x)))            # (B, 64)
+        x = self.fc2(x).squeeze(-1)                      # (B,)
+        return x
 
 
-model = LSTMModel(
-    input_size=len(env_vars),
-    hidden_size=HIDDEN_SIZE,
-    num_layers=NUM_LAYERS,
-    dropout=DROPOUT,
-).to(DEVICE)
+model = CNNModel(in_channels=len(env_vars), dropout=DROPOUT).to(DEVICE)
 
 print(f"\n[모델 구조]")
 print(model)
 print(f"\n학습 파라미터 수: {sum(p.numel() for p in model.parameters()):,}")
 
 # ── 학습 ─────────────────────────────────────────
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 criterion = nn.MSELoss()
-
-# 학습률 스케줄러
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="min", factor=0.5, patience=10
 )
 
 best_val_loss = float("inf")
-patience = 30
+best_state = None
 patience_counter = 0
-best_model_state = None
 
 train_losses, val_losses = [], []
 
@@ -217,7 +235,7 @@ for epoch in range(EPOCHS):
         loss.backward()
         optimizer.step()
         train_loss += loss.item() * len(xb)
-    train_loss /= len(X_train)
+    train_loss /= len(X_train_n)
 
     # Validation
     model.eval()
@@ -229,14 +247,13 @@ for epoch in range(EPOCHS):
     val_losses.append(val_loss)
     scheduler.step(val_loss)
 
-    # Early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
-        best_model_state = model.state_dict().copy()
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
         patience_counter = 0
     else:
         patience_counter += 1
-        if patience_counter >= patience:
+        if patience_counter >= PATIENCE:
             print(f"  Early stopping at epoch {epoch+1}")
             break
 
@@ -244,16 +261,15 @@ for epoch in range(EPOCHS):
         print(f"  Epoch {epoch+1:3d}: train_loss={train_loss:.5f}, val_loss={val_loss:.5f}")
 
 # 최적 모델 복원
-model.load_state_dict(best_model_state)
+model.load_state_dict(best_state)
 
 # ── 평가 ─────────────────────────────────────────
 model.eval()
 with torch.no_grad():
-    y_pred_scaled = model(X_test_t).cpu().numpy()
+    y_pred_n = model(X_test_t).cpu().numpy()
 
-# 역정규화
-y_pred = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-y_true = y_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+y_pred = y_scaler.inverse_transform(y_pred_n.reshape(-1, 1)).flatten()
+y_true = y_test
 
 def evaluate(y_true, y_pred):
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
@@ -266,57 +282,51 @@ def evaluate(y_true, y_pred):
 metrics = evaluate(y_true, y_pred)
 
 print(f"\n{'='*60}")
-print(f"LSTM 평가 결과 (Test)")
+print(f"CNN 평가 결과 (Test)")
 print(f"{'='*60}")
 print(f"  RMSE: {metrics['RMSE']:.2f} 톤")
 print(f"  MAE:  {metrics['MAE']:.2f} 톤")
 print(f"  MAPE: {metrics['MAPE']:.2f} %")
 print(f"  R²:   {metrics['R2']:.4f}")
 
-# ── 베이스라인 비교 ──────────────────────────────
-baseline_dir = os.path.join(os.path.dirname(nc_path), "..", "..", "outputs", "baseline")
-baseline_metrics_path = os.path.join(baseline_dir, "metrics.csv")
-
-if os.path.exists(baseline_metrics_path):
-    baseline_df = pd.read_csv(baseline_metrics_path, index_col=0)
-    print(f"\n[베이스라인 vs LSTM]")
-    print(baseline_df.round(2).to_string())
-    print(f"  LSTM            {metrics['RMSE']:7.2f} {metrics['MAE']:7.2f} {metrics['MAPE']:7.2f} {metrics['R2']:7.4f}")
+# ── 베이스라인/LSTM 비교 ─────────────────────────
+print(f"\n[모델 비교]")
+print(f"  베이스라인 XGBoost:   R² ~0.76, MAPE ~47%")
+print(f"  LSTM (시계열 단독):   R² ~0.55, MAPE ~55%")
+print(f"  CNN  (공간 단독):    R² {metrics['R2']:.3f}, MAPE {metrics['MAPE']:.1f}%")
 
 # ── 저장 ─────────────────────────────────────────
-save_dir = os.path.join(os.path.dirname(nc_path), "..", "..", "outputs", "lstm")
+save_dir = os.path.join(os.path.dirname(nc_path), "..", "..", "outputs", "cnn")
 os.makedirs(save_dir, exist_ok=True)
 
-# 모델 저장
 torch.save({
     "model_state_dict": model.state_dict(),
     "config": {
-        "input_size": len(env_vars),
-        "hidden_size": HIDDEN_SIZE,
-        "num_layers": NUM_LAYERS,
-        "dropout": DROPOUT,
-        "seq_length": SEQ_LENGTH,
+        "in_channels": len(env_vars),
+        "dropout":     DROPOUT,
     },
-}, os.path.join(save_dir, "lstm_model.pt"))
+    "x_scalers": x_scalers,
+    "y_scaler": {
+        "min": float(y_scaler.data_min_[0]),
+        "max": float(y_scaler.data_max_[0]),
+    },
+}, os.path.join(save_dir, "cnn_model.pt"))
 
-# 메트릭 저장
 with open(os.path.join(save_dir, "metrics.json"), "w", encoding="utf-8") as f:
     json.dump(metrics, f, indent=2, ensure_ascii=False)
 
-# 예측값 저장
 pred_df = pd.DataFrame({
-    "date":      pd.to_datetime(date_test),
+    "date":      date_test,
     "actual":    y_true,
     "predicted": y_pred,
 })
 pred_df.to_csv(os.path.join(save_dir, "predictions.csv"),
                index=False, encoding="utf-8-sig")
 
-# 학습 곡선 저장
 loss_df = pd.DataFrame({
-    "epoch": range(1, len(train_losses) + 1),
+    "epoch":      range(1, len(train_losses) + 1),
     "train_loss": train_losses,
-    "val_loss": val_losses,
+    "val_loss":   val_losses,
 })
 loss_df.to_csv(os.path.join(save_dir, "training_history.csv"),
                index=False, encoding="utf-8-sig")
@@ -326,11 +336,10 @@ fig, axes = plt.subplots(2, 2, figsize=(15, 10), gridspec_kw={"height_ratios": [
 
 # (1) 예측 비교
 ax = axes[0, 0]
-ax.plot(pd.to_datetime(date_test), y_true, "o-", color="#0D2444",
-        label="실제값", linewidth=2, markersize=5)
-ax.plot(pd.to_datetime(date_test), y_pred, "d--", color="#C13C2A",
-        label="LSTM 예측", linewidth=1.8, markersize=5, alpha=0.85)
-ax.set_title("LSTM 예측 결과 (Test: 2023~2025)", fontsize=12, fontweight="bold")
+ax.plot(date_test, y_true, "o-", color="#0D2444", label="실제값", linewidth=2, markersize=5)
+ax.plot(date_test, y_pred, "d--", color="#C13C2A", label="CNN 예측",
+        linewidth=1.8, markersize=5, alpha=0.85)
+ax.set_title("CNN 예측 결과 (Test: 2023~2025)", fontsize=12, fontweight="bold")
 ax.set_ylabel("어획량 (톤)")
 ax.legend(loc="best")
 ax.grid(alpha=0.3)
@@ -351,13 +360,13 @@ ax = axes[1, 0]
 metric_names = ["RMSE", "MAE", "MAPE"]
 vals = [metrics[m] for m in metric_names]
 bars = ax.bar(metric_names, vals, color=["#0F6E56", "#185FA5", "#EF9F27"], alpha=0.85)
-ax.set_title("LSTM 성능 지표", fontsize=12, fontweight="bold")
+ax.set_title("CNN 성능 지표", fontsize=12, fontweight="bold")
 ax.grid(alpha=0.3, axis="y")
 for bar, v in zip(bars, vals):
     ax.text(bar.get_x() + bar.get_width()/2, v + max(vals)*0.02,
             f"{v:.2f}", ha="center", fontsize=11, fontweight="bold")
 
-# (4) 산점도 (실제 vs 예측)
+# (4) 산점도
 ax = axes[1, 1]
 ax.scatter(y_true, y_pred, alpha=0.65, color="#185FA5", s=50, edgecolor="white")
 lim = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
@@ -369,7 +378,7 @@ ax.legend()
 ax.grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig(os.path.join(save_dir, "lstm_results.png"),
+plt.savefig(os.path.join(save_dir, "cnn_results.png"),
             dpi=120, bbox_inches="tight")
 
 print(f"\n[저장 위치]")
@@ -378,7 +387,7 @@ print(f"  {save_dir}")
 plt.show()
 messagebox.showinfo(
     "완료",
-    f"LSTM 학습 완료!\n\n"
+    f"CNN 학습 완료!\n\n"
     f"R²: {metrics['R2']:.4f}\n"
     f"MAPE: {metrics['MAPE']:.2f}%\n"
     f"RMSE: {metrics['RMSE']:.2f}톤"
